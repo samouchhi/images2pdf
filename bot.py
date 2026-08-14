@@ -11,9 +11,10 @@ import time
 import img2pdf
 from dotenv import load_dotenv
 from reportlab.lib.pagesizes import A4
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -75,7 +76,19 @@ def cleanup_user(user_id: int) -> None:
         shutil.rmtree(session_dir, ignore_errors=True)
 
 
-async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def build_convert_buttons() -> InlineKeyboardMarkup:
+    """Inline Convert/Cancel buttons shown when a batch is ready."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Convert ✅", callback_data="convert"),
+                InlineKeyboardButton("Cancel ❌", callback_data="cancel_batch"),
+            ]
+        ]
+    )
+
+
+async def do_convert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Convert the user's batch to a PDF and send it."""
     user_id = update.effective_user.id
     images = get_batch(user_id)
@@ -111,13 +124,33 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def handle_convert_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle Convert / Cancel button presses."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    await query.answer()
+
+    if query.data == "convert":
+        await do_convert(update, context)
+    elif query.data == "cancel_batch":
+        count = len(get_batch(user_id))
+        cleanup_user(user_id)
+        await query.edit_message_text(
+            f"Cancelled — cleared {count} photo(s)."
+            if count
+            else "Nothing to cancel."
+        )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Send me photos (one by one or as an album) and I'll combine them "
         "into a PDF.\n\n"
-        "• Send /pdf to convert your batch\n"
-        "• Caption a photo with 'make pdf' to convert instantly\n"
-        "• Send /cancel to clear your batch"
+        "• After sending photos, tap Convert to make the PDF\n"
+        "• Tap Cancel to clear your batch\n"
+        "• Caption a photo with 'make pdf' to convert instantly"
     )
 
 
@@ -131,6 +164,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await update.effective_message.reply_text("Nothing to cancel.")
+
+
+async def prompt_convert(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
+) -> None:
+    """Reply with Convert/Cancel buttons for the user's current batch."""
+    total = len(get_batch(user_id))
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Batch has {total} photo(s). Convert to PDF?",
+        reply_markup=build_convert_buttons(),
+    )
 
 
 async def flush_album(
@@ -162,12 +207,7 @@ async def flush_album(
         added += 1
 
     if added:
-        total = len(get_batch(user_id))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"Added {added} photo(s). Batch now has {total} photo(s). "
-            "Send /pdf when done.",
-        )
+        await prompt_convert(context, chat_id, user_id)
     else:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -189,7 +229,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         get_added_ids(user_id).add(message.photo[-1].file_unique_id)
         get_batch(user_id).append(path)
-        await convert_pdf(update, context)
+        await do_convert(update, context)
         return
 
     # Album -> buffer until the group finishes arriving.
@@ -212,10 +252,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     get_added_ids(user_id).add(photo.file_unique_id)
     get_batch(user_id).append(path)
-    total = len(get_batch(user_id))
-    await message.reply_text(
-        f"Added. {total} photo(s) so far. Send /pdf when done."
-    )
+    await prompt_convert(context, message.chat_id, user_id)
 
 
 def _caption_triggers(caption: str) -> bool:
@@ -226,8 +263,13 @@ def _caption_triggers(caption: str) -> bool:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text.strip().lower()
     if text in ("pdf", "make pdf"):
-        await convert_pdf(update, context)
-
+        user_id = update.effective_user.id
+        if not get_batch(user_id):
+            await update.effective_message.reply_text(
+                "No photos in your batch yet. Send me some photos first."
+            )
+            return
+        await prompt_convert(context, update.effective_message.chat_id, user_id)
 
 def main() -> None:
     if not TOKEN:
@@ -238,9 +280,8 @@ def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("pdf", convert_pdf))
-    app.add_handler(CommandHandler("convert", convert_pdf))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(handle_convert_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
