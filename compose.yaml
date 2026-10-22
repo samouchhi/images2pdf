@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in .env before starting the bot}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
